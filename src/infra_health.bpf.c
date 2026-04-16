@@ -6,11 +6,16 @@
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 1 << 20);
+} events_rb SEC(".maps");
+
 #ifndef XDP_PASS
 #define XDP_PASS 2
 #endif
 
-SEC("xdp/health")
+SEC("xdp")
 int health_check(struct xdp_md *ctx)
 {
     return XDP_PASS;

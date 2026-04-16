@@ -31,7 +31,6 @@ SRC_DIR   := src
 US_DIR    := userspace
 INC_DIR   := include
 BIN_DIR   := bin
-OBJ_DIR   := obj
 
 # ── Flags ──────────────────────────────────────────────────────────────
 
@@ -66,7 +65,7 @@ FEATURES := \
     infra_health
 
 # ── Derived file lists ─────────────────────────────────────────────────
-BPF_OBJS  := $(patsubst %,$(OBJ_DIR)/%.bpf.o,$(FEATURES))
+BPF_OBJS  := $(patsubst %,$(BIN_DIR)/%.bpf.o,$(FEATURES))
 US_BINS   := $(patsubst %,$(BIN_DIR)/%,$(FEATURES))
 
 # ── Default target ─────────────────────────────────────────────────────
@@ -78,7 +77,7 @@ all: dirs $(BPF_OBJS) $(US_BINS)
 
 # ── Create output directories ──────────────────────────────────────────
 dirs:
-	@mkdir -p $(BIN_DIR) $(OBJ_DIR)
+	@mkdir -p $(BIN_DIR)
 
 # ── Generate vmlinux.h from the running kernel ─────────────────────────
 vmlinux: vmlinux.h
@@ -88,7 +87,7 @@ vmlinux.h:
 	$(BPFTOOL) btf dump file /sys/kernel/btf/vmlinux format c > $@
 
 # ── BPF kernel program compilation ─────────────────────────────────────
-$(OBJ_DIR)/%.bpf.o: $(SRC_DIR)/%.bpf.c $(INC_DIR)/*.h vmlinux.h
+$(BIN_DIR)/%.bpf.o: $(SRC_DIR)/%.bpf.c $(INC_DIR)/*.h vmlinux.h
 	@echo "[BPF]  $<"
 	$(CLANG) $(BPF_CFLAGS) -c $< -o $@
 	$(STRIP) -g $@
@@ -99,19 +98,19 @@ $(BIN_DIR)/%: $(US_DIR)/%_user.c $(INC_DIR)/*.h
 	$(CC) $(US_CFLAGS) $< $(US_LDFLAGS) -o $@
 
 # ── Per-feature convenience targets ────────────────────────────────────
-$(FEATURES): %: dirs $(OBJ_DIR)/%.bpf.o $(BIN_DIR)/%
+$(FEATURES): %: dirs $(BIN_DIR)/%.bpf.o $(BIN_DIR)/%
 	@echo "Built feature: $@"
 
 # ── Phony helpers ──────────────────────────────────────────────────────
 install: all
-	@echo "Copying BPF objects to /usr/lib/ebpf-suite/ ..."
+	@echo "Installing to /usr/lib/ebpf-suite/ ..."
 	install -d /usr/lib/ebpf-suite
-	install -m 644 $(OBJ_DIR)/*.bpf.o /usr/lib/ebpf-suite/
+	install -m 644 $(BIN_DIR)/*.bpf.o /usr/lib/ebpf-suite/
 	install -d /usr/local/bin
 	install -m 755 $(BIN_DIR)/* /usr/local/bin/
 
 clean:
-	@rm -rf $(OBJ_DIR) $(BIN_DIR)
+	@rm -rf $(BIN_DIR)
 	@echo "Cleaned."
 
 # ── Dependency: vmlinux.h must exist before BPF sources compile ────────

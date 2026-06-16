@@ -1,0 +1,306 @@
+// SPDX-License-Identifier: GPL-2.0
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"log"
+	"net"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/link"
+	"github.com/cilium/ebpf/ringbuf"
+	"github.com/cilium/ebpf/rlimit"
+)
+
+// --- Go-side representations of the eBPF types (must match C layout) ---
+
+type RewriteKey struct {
+	DstIP    [4]byte
+	DstPort  uint16 // network byte order
+	Protocol uint8
+	Pad      uint8
+}
+
+type RewriteVal struct {
+	NewDstIP   [4]byte
+	NewDstPort uint16 // network byte order
+}
+
+type Event struct {
+	SrcIP       [4]byte
+	OrigDstIP   [4]byte
+	NewDstIP    [4]byte
+	OrigDstPort uint16
+	NewDstPort  uint16
+	Protocol    uint8
+	Matched     uint8
+}
+
+// --- helpers ---
+
+func ip4toArr(ip net.IP) [4]byte {
+	var a [4]byte
+	copy(a[:], ip.To4())
+	return a
+}
+
+// htons converts a uint16 from host byte order to network byte order.
+// binary.BigEndian is network order on all architectures.
+func htons(v uint16) uint16 {
+	var buf [2]byte
+	binary.BigEndian.PutUint16(buf[:], v)
+	return binary.LittleEndian.Uint16(buf[:])
+}
+
+// ntohs converts a uint16 from network byte order to host byte order.
+func ntohs(v uint16) uint16 {
+	var buf [2]byte
+	binary.LittleEndian.PutUint16(buf[:], v)
+	return binary.BigEndian.Uint16(buf[:])
+}
+
+// --- configuration ---
+
+type ProxyTarget struct {
+	Domain  string
+	Port    uint16 // the port the domain serves on (e.g. 443 for HTTPS)
+	Proto   uint8  // 6 = TCP
+}
+
+type ProxyConfig struct {
+	IP   net.IP
+	Port uint16
+}
+
+// domains we want to intercept
+var targets = []ProxyTarget{
+	{Domain: "chatgpt.com", Port: 443, Proto: 6},
+	{Domain: "openai.com", Port: 443, Proto: 6},
+	{Domain: "api.openai.com", Port: 443, Proto: 6},
+	{Domain: "cdn.oaistatic.com", Port: 443, Proto: 6},
+	{Domain: "cdn.openai.com", Port: 443, Proto: 6},
+}
+
+// proxy address (no actual proxy — just the address we'd redirect to)
+var proxyConfig = ProxyConfig{
+	IP:   net.ParseIP("10.0.0.50"), // placeholder proxy IP
+	Port: 8080,
+}
+
+// DNS refresh interval
+const dnsRefreshInterval = 60 * time.Second
+
+// --- DNS resolver ---
+
+// resolveDomains resolves each target domain to its IPv4 addresses
+// and returns a map ready for the eBPF rewrite rules.
+func resolveDomains(targets []ProxyTarget) map[RewriteKey]RewriteVal {
+	rules := make(map[RewriteKey]RewriteVal)
+
+	for _, t := range targets {
+		ips, err := net.DefaultResolver.LookupNetIP(context.Background(), "ip4", t.Domain)
+		if err != nil {
+			log.Printf("DNS resolution failed for %s: %v", t.Domain, err)
+			continue
+		}
+		for _, ip := range ips {
+			key := RewriteKey{
+				DstIP:    ip4toArr(ip.AsSlice()),
+				DstPort:  htons(t.Port),
+				Protocol: t.Proto,
+			}
+			val := RewriteVal{
+				NewDstIP:   ip4toArr(proxyConfig.IP),
+				NewDstPort: htons(proxyConfig.Port),
+			}
+			rules[key] = val
+			log.Printf("  [rule] %s (%s:%d) -> proxy %s:%d",
+				t.Domain, ip, t.Port, proxyConfig.IP, proxyConfig.Port)
+		}
+	}
+	return rules
+}
+
+// --- ring buffer reader ---
+
+func readEvents(rd *ringbuf.Reader, logger *log.Logger) {
+	defer rd.Close()
+
+	logger.Println("event reader started")
+	for {
+		record, err := rd.Read()
+		if err != nil {
+			if errors.Is(err, ringbuf.ErrClosed) {
+				return
+			}
+			logger.Printf("ringbuf read error: %v", err)
+			continue
+		}
+
+		var evt Event
+		if err := binary.Read(bytes.NewReader(record.RawSample),
+			binary.LittleEndian, &evt); err != nil {
+			continue
+		}
+
+		srcIP := net.IP(evt.SrcIP[:]).String()
+		origDstIP := net.IP(evt.OrigDstIP[:]).String()
+		origPort := ntohs(evt.OrigDstPort)
+
+		if evt.Matched > 0 {
+			newDstIP := net.IP(evt.NewDstIP[:]).String()
+			newPort := ntohs(evt.NewDstPort)
+			logger.Printf("[REDIRECT] %s -> %s:%d  =>  %s:%d (was going to %s:%d)",
+				srcIP, origDstIP, origPort, newDstIP, newPort, origDstIP, origPort)
+		} else {
+			logger.Printf("[PASS] %s -> %s:%d (no match)", srcIP, origDstIP, origPort)
+		}
+	}
+}
+
+// --- legacy TC netlink attachment (fallback for kernels < 6.6) ---
+
+func attachLegacyTC(prog *ebpf.Program, ifaceName string) (link.Link, error) {
+	// For kernels < 6.6, we need florianl/go-tc to set up clsact qdisc
+	// and attach the BPF filter. This returns a dummy link that we can
+	// use for cleanup (by removing the filter on close).
+	//
+	// Since we target TCX (6.6+) for this POC, the fallback is a stub.
+	// In production, implement the full netlink path using:
+	//   github.com/florianl/go-tc
+	//   github.com/mdlayher/netlink
+	return nil, fmt.Errorf("legacy TC not implemented; requires kernel 6.6+ with TCX support")
+}
+
+// --- main ---
+
+func main() {
+	logger := log.New(os.Stdout, "[ebpf-agent] ", log.Ldate|log.Ltime|log.Lshortfile)
+
+	// Allow the current process to lock memory for eBPF maps/programs
+	if err := rlimit.RemoveMemlock(); err != nil {
+		logger.Fatalf("remove memlock: %v", err)
+	}
+
+	// Load compiled eBPF objects (auto-generated by bpf2go)
+	var objs bpfObjects
+	if err := loadBpfObjects(&objs, nil); err != nil {
+		var ve *ebpf.VerifierError
+		if errors.As(err, &ve) {
+			logger.Fatalf("verifier error:\n%+v", ve)
+		}
+		logger.Fatalf("loading eBPF objects: %v", err)
+	}
+	defer objs.Close()
+	logger.Println("eBPF objects loaded successfully")
+
+	// Determine the interface to attach to.
+	// In Kubernetes DaemonSet mode, use the primary node interface.
+	// For local dev, use the default route interface.
+	ifaceName := os.Getenv("EBPF_IFACE")
+	if ifaceName == "" {
+		ifaceName = getDefaultInterface()
+	}
+	iface, err := net.InterfaceByName(ifaceName)
+	if err != nil {
+		logger.Fatalf("interface %q: %v", ifaceName, err)
+	}
+	logger.Printf("using interface: %s (index %d)", iface.Name, iface.Index)
+
+	// Attach TC egress program — try TCX first, fallback to legacy
+	var tcLink link.Link
+	tcLink, err = link.AttachTCX(link.TCXOptions{
+		Interface: iface.Index,
+		Program:   objs.TcEgressHandler,
+		Attach:    ebpf.AttachTCXEgress,
+	})
+	if err != nil {
+		logger.Printf("TCX not available (%v), trying legacy TC...", err)
+		tcLink, err = attachLegacyTC(objs.TcEgressHandler, ifaceName)
+		if err != nil {
+			logger.Fatalf("failed to attach TC program: %v", err)
+		}
+	}
+	defer tcLink.Close()
+	logger.Println("TC egress program attached")
+
+	// ---- Populate rewrite rules via DNS resolution ----
+
+	logger.Println("resolving target domains...")
+	rules := resolveDomains(targets)
+	if len(rules) == 0 {
+		logger.Fatal("no rules generated — check DNS resolution or network connectivity")
+	}
+	logger.Printf("generated %d rewrite rules", len(rules))
+
+	for k, v := range rules {
+		if err := objs.RewriteRules.Put(k, v); err != nil {
+			logger.Printf("error adding rule %+v: %v", k, err)
+		}
+	}
+
+	// ---- Periodic DNS refresh goroutine ----
+	go func() {
+		ticker := time.NewTicker(dnsRefreshInterval)
+		defer ticker.Stop()
+		for range ticker.C {
+			logger.Println("refreshing DNS resolutions...")
+			newRules := resolveDomains(targets)
+			if len(newRules) == 0 {
+				continue
+			}
+			// Walk current map and remove stale entries.
+			// For a POC, replace wholesale.
+			var prevKey RewriteKey
+			var prevVal RewriteVal
+			it := objs.RewriteRules.Iterate()
+			for it.Next(&prevKey, &prevVal) {
+				if _, keep := newRules[prevKey]; !keep {
+					_ = objs.RewriteRules.Delete(prevKey)
+					logger.Printf("  removed stale rule for %s:%d (proto %d)",
+						net.IP(prevKey.DstIP[:]), ntohs(prevKey.DstPort), prevKey.Protocol)
+				}
+			}
+			// Add/update current rules
+			for k, v := range newRules {
+				if err := objs.RewriteRules.Put(k, v); err != nil {
+					logger.Printf("  error updating rule: %v", err)
+				}
+			}
+			logger.Printf("DNS refresh complete — %d rules active", len(newRules))
+		}
+	}()
+
+	// ---- Start ring buffer event reader ----
+	rd, err := ringbuf.NewReader(objs.Events)
+	if err != nil {
+		logger.Fatalf("ringbuf reader: %v", err)
+	}
+
+	go readEvents(rd, logger)
+
+	// ---- Wait for shutdown ----
+	logger.Println("eBPF agent running. Press Ctrl+C to stop.")
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	<-sig
+
+	logger.Println("shutting down...")
+}
+
+// getDefaultInterface returns the name of the interface used by the default route.
+func getDefaultInterface() string {
+	// Try to find the default route interface via netlink
+	// (simplified: parse /proc/net/route)
+	//
+	// For this POC, use "eth0" as the sensible default.
+	return "eth0"
+}

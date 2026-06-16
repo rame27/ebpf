@@ -1,0 +1,102 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ebpf-intercept
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ebpf-agent
+  namespace: ebpf-intercept
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ebpf-agent
+rules:
+  - resources:
+      - nodes
+    apiGroups:
+      - ""
+    verbs:
+      - get
+      - list
+      - watch
+  - resources:
+      - pods
+    apiGroups:
+      - ""
+    verbs:
+      - get
+      - list
+      - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ebpf-agent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ebpf-agent
+subjects:
+  - kind: ServiceAccount
+    name: ebpf-agent
+    namespace: ebpf-intercept
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ebpf-agent
+  namespace: ebpf-intercept
+  labels:
+    app: ebpf-agent
+spec:
+  selector:
+    matchLabels:
+      app: ebpf-agent
+  template:
+    metadata:
+      labels:
+        app: ebpf-agent
+    spec:
+      serviceAccountName: ebpf-agent
+      hostNetwork: true
+      hostPID: true
+      priorityClassName: system-node-critical
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: ebpf-agent
+          image: ebpf-agent:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - /ebpf-agent
+          env:
+            - name: EBPF_IFACE
+              value: "eth0"
+            - name: PROXY_IP
+              value: "10.0.0.50"
+            - name: PROXY_PORT
+              value: "8080"
+          securityContext:
+            privileged: true
+            capabilities:
+              add:
+                - BPF
+                - NET_ADMIN
+                - NET_RAW
+                - PERFMON
+                - SYS_ADMIN
+                - SYS_RESOURCE
+            seccompProfile:
+              type: Unconfined
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "100m"
+            limits:
+              memory: "128Mi"
+              cpu: "500m"
+      terminationGracePeriodSeconds: 30
